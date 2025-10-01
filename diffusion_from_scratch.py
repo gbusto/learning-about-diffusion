@@ -5,6 +5,7 @@ from typing import List, Optional
 import numpy as np
 import os
 import math
+import argparse
 
 # ====== Constants ======
 IMAGE_SIZE = (28, 28)                 # MNIST size
@@ -21,6 +22,10 @@ def load_mnist_train():
 def get_mnist_image(dataset, index: int) -> Image.Image:
     """Return a single MNIST example as a PIL.Image (grayscale)."""
     return dataset[index]["image"]
+
+def get_mnist_images(dataset, start_index: int, end_index: int) -> List[Image.Image]:
+    """Return a list of MNIST examples as PIL.Images (grayscale)."""
+    return [dataset[i]["image"] for i in range(start_index, end_index)]
 
 
 # ====== Image <-> Vector ([-1, 1]) ======
@@ -160,6 +165,8 @@ def make_clean_to_noisy_tiles(x0_vec: np.ndarray,
 
     base_noise = None
     if reuse_same_noise:
+        # Helpful for visualizing noise being added in a nice way;
+        #   basically, forward noising is just turning up the opacity of the "noise"
         base_noise = np.random.randn(*x0_vec.shape).astype(np.float32)
 
     pil_images: List[Image.Image] = []
@@ -176,34 +183,93 @@ def make_clean_to_noisy_tiles(x0_vec: np.ndarray,
     return pil_images
 
 
-# ====== Main demo ======
+# ====== Generate training data (returns arrays ready for saving/training) ======
+
+def generate_training_data(
+    schedule: DiffusionSchedule,
+    images: List[Image.Image],
+    versions_per_image: int = 10,
+    rng: Optional[np.random.RandomState] = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Produce parallel arrays:
+      X_t : (N, 784) float32  — noisy inputs
+      t   : (N,)    int64     — integer timesteps in [0, T-1]
+      X0  : (N, 784) float32  — clean targets
+
+    N = len(images) * versions_per_image
+    """
+    rng = rng or np.random.RandomState()
+    T = len(schedule.alpha_bar)
+
+    X_t_list: list[np.ndarray] = []
+    t_list:  list[int]         = []
+    X0_list: list[np.ndarray]  = []
+
+    for img in images:
+        x0_vec = pil_to_vec_minus1_1(img)  # (784,), [-1,1]
+        for _ in range(versions_per_image):
+            t_int = int(rng.randint(0, T))
+            x_t_vec = forward_noisy_sample(
+                x0_vec=x0_vec,
+                timestep=t_int,
+                schedule=schedule,
+                noise=None,            # fresh Gaussian noise inside
+                clip_for_viz=False     # don't clip during training data creation
+            )
+            X_t_list.append(x_t_vec)
+            t_list.append(t_int)
+            X0_list.append(x0_vec)
+
+    # Convert to arrays in the right dtypes/shapes for saving and training
+    X_t = np.stack(X_t_list).astype(np.float32)   # (N, 784)
+    t   = np.asarray(t_list, dtype=np.int64)      # (N,)
+    X0  = np.stack(X0_list).astype(np.float32)    # (N, 784)
+    return X_t, t, X0
+
+
+# ====== Main: build schedule, generate arrays, save .npz ======
 
 if __name__ == "__main__":
-    if not os.path.exists("./tmp"):
-        os.makedirs("./tmp")
+    import argparse, os
 
-    # 1) Load one or more MNIST images
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42424242, help="RNG seed")
+    parser.add_argument("--num-steps", type=int, default=100, help="diffusion steps T")
+    parser.add_argument("--num-images", type=int, default=1000, help="how many MNIST images to use")
+    parser.add_argument("--versions-per-image", type=int, default=10, help="noisy examples per image")
+    parser.add_argument("--out", type=str, default="./tmp/training_data.npz", help="output .npz path")
+    parser.add_argument("--preview", type=int, default=0, help="optional: save 2*preview tiles [noisy, clean]")
+    args = parser.parse_args()
+
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    rng = np.random.RandomState(args.seed)
+
+    # 1) Load data
     ds = load_mnist_train()
-    img0 = get_mnist_image(ds, 0)
-    img1 = get_mnist_image(ds, 1)
-    img2 = get_mnist_image(ds, 2)
+    images = get_mnist_images(ds, 0, args.num_images)
 
-    # 2) Convert to vectors in [-1,1]
-    x0_vec = pil_to_vec_minus1_1(img0)
-    x1_vec = pil_to_vec_minus1_1(img1)
-    x2_vec = pil_to_vec_minus1_1(img2)
+    # 2) Build schedule
+    schedule = build_linear_schedule(num_steps=args.num_steps, beta_start=1e-4, beta_end=2e-2)
 
-    # 3) Build a simple linear schedule
-    NUM_STEPS = 100  # keep small for visualization
-    schedule = build_linear_schedule(num_steps=NUM_STEPS, beta_start=1e-4, beta_end=2e-2)
+    # 3) Generate arrays ready for saving / training
+    X_t, t, X0 = generate_training_data(
+        schedule=schedule,
+        images=images,
+        versions_per_image=args.versions_per_image,
+        rng=rng
+    )
 
-    # 4) Make and save a single clean→noisy grid for one digit
-    tiles = make_clean_to_noisy_tiles(x0_vec, schedule, tiles_count=16, reuse_same_noise=True)
-    save_pil_grid(tiles, "./tmp/mnist_clean_to_noisy.png", cols=GRID_COLS)
+    # 4) Save a single .npz with named arrays
+    np.savez(args.out, X_t=X_t, t=t, X0=X0)
+    print(f"Saved {args.out}")
+    print(f"  X_t: {X_t.shape} {X_t.dtype}  | t: {t.shape} {t.dtype}  | X0: {X0.shape} {X0.dtype}")
 
-    # 5) (Optional) Make a 3-row grid: 3 different digits, each across 8 steps
-    all_tiles: List[Image.Image] = []
-    for vec in (x0_vec, x1_vec, x2_vec):
-        row_tiles = make_clean_to_noisy_tiles(vec, schedule, tiles_count=8, reuse_same_noise=True)
-        all_tiles.extend(row_tiles)
-    save_pil_grid(all_tiles, "./tmp/mnist_three_rows.png", cols=GRID_COLS)
+    # 5) (optional) quick visual sanity check: [noisy, clean] pairs
+    if args.preview > 0:
+        k = min(args.preview, X_t.shape[0])
+        tiles: list[Image.Image] = []
+        for i in range(k):
+            tiles.append(vec_minus1_1_to_pil(np.clip(X_t[i], -1.0, 1.0)))
+            tiles.append(vec_minus1_1_to_pil(np.clip(X0[i], -1.0, 1.0)))
+        save_pil_grid(tiles, "./tmp/training_preview.png", cols=2)
